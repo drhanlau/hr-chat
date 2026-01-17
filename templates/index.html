@@ -7,6 +7,8 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Prism.js for syntax highlighting -->
+    <link href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
     <style>
         * {
             margin: 0;
@@ -292,6 +294,53 @@
             line-height: 1.7;
         }
 
+        /* Prism.js overrides for dark theme */
+        .message-content pre[class*="language-"] {
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 16px;
+            margin: 8px 0 12px 0;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .message-content code[class*="language-"] {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 13px;
+            text-shadow: none;
+        }
+
+        /* SQL keyword colors */
+        .token.keyword {
+            color: #c678dd;
+        }
+
+        .token.function {
+            color: #61afef;
+        }
+
+        .token.string {
+            color: #98c379;
+        }
+
+        .token.number {
+            color: #d19a66;
+        }
+
+        .token.operator {
+            color: #56b6c2;
+        }
+
+        .token.punctuation {
+            color: #abb2bf;
+        }
+
+        .token.comment {
+            color: #5c6370;
+            font-style: italic;
+        }
+
         .sql-label, .results-label {
             font-size: 12px;
             color: #8b5cf6;
@@ -488,6 +537,8 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-sql.min.js"></script>
     <script>
         // Configure marked for safe rendering
         marked.setOptions({
@@ -534,10 +585,10 @@
             if (sql || results) {
                 detailsHtml = '<div class="details-section">';
                 if (sql) {
-                    detailsHtml += `<span class="sql-label">SQL Query</span><pre><code>${escapeHtml(sql)}</code></pre>`;
+                    detailsHtml += `<span class="sql-label">SQL Query</span><pre class="language-sql"><code class="language-sql">${escapeHtml(sql)}</code></pre>`;
                 }
                 if (results) {
-                    detailsHtml += `<span class="results-label">Results</span><pre><code>${escapeHtml(results)}</code></pre>`;
+                    detailsHtml += `<span class="results-label">Results</span><pre class="language-plaintext"><code>${escapeHtml(results)}</code></pre>`;
                 }
                 detailsHtml += '</div>';
             }
@@ -555,6 +606,9 @@
 
             messagesEl.appendChild(messageEl);
             messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            // Apply syntax highlighting
+            Prism.highlightAllUnder(messageEl);
         }
 
         function addLoadingIndicator() {
