@@ -6,7 +6,8 @@ A web-based chat interface for querying HR data using natural language.
 
 import sqlite3
 import os
-from flask import Flask, render_template, request, jsonify
+import json
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -33,27 +34,38 @@ Columns:
   - salary: TEXT (low, medium, high)
 """
 
-SYSTEM_PROMPT = f"""You are an HR data analyst assistant. You help answer questions about employee data by generating SQL queries.
+SYSTEM_PROMPT = f"""You are an expert HR assistant with two capabilities:
 
-Database Schema:
+1. **Data Analysis**: You can query an employee database to answer data-driven questions
+2. **General HR Knowledge**: You can answer general HR questions about best practices, policies, strategies, and advice
+
+## Database Schema (for data queries):
 {SCHEMA}
 
-When the user asks a question:
-1. Generate a valid SQLite SQL query to answer their question
-2. Return ONLY the SQL query wrapped in ```sql``` code blocks
-3. Keep queries efficient and use appropriate aggregations
-4. For percentage calculations, multiply by 100 and round to 2 decimal places
-5. Limit results to 20 rows unless the user asks for more
-6. Use descriptive column aliases for readability
+## How to respond:
 
-If the question cannot be answered with the available data, explain why.
-If the question is ambiguous, make reasonable assumptions and state them.
+**For DATA questions** (requiring database lookup):
+- Questions about specific employee metrics, counts, averages, comparisons, trends
+- Examples: "How many employees left?", "What's the average satisfaction?", "Which department has highest turnover?"
+- Response: Generate a valid SQLite SQL query wrapped in ```sql``` code blocks
+- Keep queries efficient, limit to 20 rows unless specified
+- Use descriptive column aliases
+
+**For GENERAL HR questions** (not requiring data):
+- Questions about HR best practices, policies, strategies, career advice, management tips
+- Examples: "How to improve employee retention?", "What causes burnout?", "How to conduct performance reviews?"
+- Response: Provide a helpful, informative answer directly WITHOUT any SQL code
+- Use markdown formatting for readability
+- Draw from HR best practices and industry knowledge
+
+**Decision Rule**: Only generate SQL if the question specifically requires data from the employee database. For conceptual, strategic, or advice-based questions, answer directly.
 """
 
 ANALYSIS_PROMPT = """Based on the user's question and the query results, provide a clear, concise answer.
 Be conversational but informative. Include specific numbers from the results.
 If the results are empty, explain what that means in context.
-Keep responses brief but complete. Use markdown formatting for readability."""
+Keep responses brief but complete. Use markdown formatting for readability.
+When appropriate, add brief insights or recommendations based on the data."""
 
 
 class HRAgent:
@@ -116,32 +128,62 @@ class HRAgent:
 
         return "\n".join(lines)
 
-    def ask(self, question: str) -> dict:
-        """Process a question and return an answer with metadata."""
+    def ask_stream(self, question: str):
+        """Process a question and yield streaming responses."""
         try:
             self.conversation_history.append({"role": "user", "content": question})
 
+            # Phase 1: Generate initial response (may contain SQL or direct answer)
+            yield json.dumps({"type": "status", "content": "Thinking..."}) + "\n"
+
             messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.conversation_history
-            response = self.client.chat.completions.create(
+
+            # Stream the first response
+            full_response = ""
+            yield json.dumps({"type": "phase", "content": "generating"}) + "\n"
+
+            stream = self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=1024,
-                messages=messages
+                max_tokens=4096,
+                messages=messages,
+                stream=True
             )
 
-            assistant_message = response.choices[0].message.content
-            self.conversation_history.append({"role": "assistant", "content": assistant_message})
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    full_response += content
+                    yield json.dumps({"type": "token", "content": content}) + "\n"
 
-            sql = self.extract_sql(assistant_message)
+            self.conversation_history.append({"role": "assistant", "content": full_response})
+
+            # Check if response contains SQL
+            sql = self.extract_sql(full_response)
 
             if not sql:
-                return {
-                    "answer": assistant_message,
+                # No SQL - this is a general HR answer
+                yield json.dumps({
+                    "type": "done",
                     "sql": None,
                     "results": None
-                }
+                }) + "\n"
+                return
 
-            columns, results = self.execute_query(sql)
-            formatted_results = self.format_results(columns, results)
+            # Phase 2: Execute SQL query
+            yield json.dumps({"type": "status", "content": "Executing SQL query..."}) + "\n"
+            yield json.dumps({"type": "sql", "content": sql}) + "\n"
+
+            try:
+                columns, results = self.execute_query(sql)
+                formatted_results = self.format_results(columns, results)
+                yield json.dumps({"type": "results", "content": formatted_results}) + "\n"
+            except Exception as e:
+                yield json.dumps({"type": "error", "content": f"SQL Error: {e}"}) + "\n"
+                return
+
+            # Phase 3: Analyze results with streaming
+            yield json.dumps({"type": "status", "content": "Analyzing results..."}) + "\n"
+            yield json.dumps({"type": "phase", "content": "analyzing"}) + "\n"
 
             analysis_request = f"""Question: {question}
 
@@ -155,33 +197,32 @@ Results:
 
 Please provide a brief, helpful answer based on these results."""
 
-            analysis_response = self.client.chat.completions.create(
+            analysis_stream = self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=1024,
+                max_tokens=4096,
                 messages=[
                     {"role": "system", "content": ANALYSIS_PROMPT},
                     {"role": "user", "content": analysis_request}
-                ]
+                ],
+                stream=True
             )
 
-            analysis = analysis_response.choices[0].message.content
+            for chunk in analysis_stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    yield json.dumps({"type": "analysis_token", "content": content}) + "\n"
 
-            return {
-                "answer": analysis,
+            yield json.dumps({
+                "type": "done",
                 "sql": sql,
                 "results": formatted_results
-            }
+            }) + "\n"
 
         except Exception as e:
             # Remove the failed message from history
             if self.conversation_history and self.conversation_history[-1]["role"] == "user":
                 self.conversation_history.pop()
-            return {
-                "answer": None,
-                "sql": None,
-                "results": None,
-                "error": str(e)
-            }
+            yield json.dumps({"type": "error", "content": str(e)}) + "\n"
 
     def clear_history(self):
         """Clear conversation history."""
@@ -204,20 +245,27 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api/chat", methods=["POST"])
-def chat():
+@app.route("/api/chat/stream", methods=["POST"])
+def chat_stream():
     data = request.json
     question = data.get("message", "").strip()
 
     if not question:
         return jsonify({"error": "No message provided"}), 400
 
-    try:
+    def generate():
         hr_agent = get_agent()
-        result = hr_agent.ask(question)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        for chunk in hr_agent.ask_stream(question):
+            yield f"data: {chunk}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @app.route("/api/clear", methods=["POST"])

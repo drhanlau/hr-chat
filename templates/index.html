@@ -184,6 +184,18 @@
             color: #a1a1aa;
         }
 
+        .status-indicator {
+            font-size: 12px;
+            color: #8b5cf6;
+            margin-left: 8px;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
         .message-content {
             padding-left: 36px;
         }
@@ -341,12 +353,24 @@
             font-style: italic;
         }
 
-        .sql-label, .results-label {
+        .sql-label, .results-label, .analysis-label {
             font-size: 12px;
             color: #8b5cf6;
             font-weight: 500;
             margin-bottom: 4px;
             display: block;
+        }
+
+        .analysis-label {
+            margin-top: 16px;
+        }
+
+        .analysis-content {
+            background: rgba(139, 92, 246, 0.05);
+            border-left: 3px solid #8b5cf6;
+            padding: 12px 16px;
+            border-radius: 0 8px 8px 0;
+            margin-top: 8px;
         }
 
         .details-section {
@@ -611,32 +635,41 @@
             Prism.highlightAllUnder(messageEl);
         }
 
-        function addLoadingIndicator() {
-            const loadingEl = document.createElement('div');
-            loadingEl.className = 'message';
-            loadingEl.id = 'loading';
-            loadingEl.innerHTML = `
+        function createStreamingMessage() {
+            if (welcomeEl) {
+                welcomeEl.remove();
+            }
+
+            const messageEl = document.createElement('div');
+            messageEl.className = 'message';
+            messageEl.innerHTML = `
                 <div class="message-header">
                     <div class="avatar assistant">🤖</div>
                     <span class="message-label">HR Agent</span>
+                    <span class="status-indicator"></span>
                 </div>
-                <div class="loading">
-                    <div class="loading-dots">
-                        <span></span>
-                        <span></span>
-                        <span></span>
+                <div class="message-content">
+                    <div class="markdown-body stream-content"></div>
+                    <div class="details-section" style="display: none;">
+                        <span class="sql-label">SQL Query</span>
+                        <pre class="language-sql sql-block" style="display: none;"><code class="language-sql sql-content"></code></pre>
+                        <span class="results-label" style="display: none;">Results</span>
+                        <pre class="language-plaintext results-block" style="display: none;"><code class="results-content"></code></pre>
+                        <span class="analysis-label" style="display: none;">Analysis</span>
+                        <div class="markdown-body analysis-content" style="display: none;"></div>
                     </div>
-                    <span>Analyzing...</span>
                 </div>
             `;
-            messagesEl.appendChild(loadingEl);
+            messagesEl.appendChild(messageEl);
             messagesEl.scrollTop = messagesEl.scrollHeight;
+            return messageEl;
         }
 
-        function removeLoadingIndicator() {
-            const loadingEl = document.getElementById('loading');
-            if (loadingEl) {
-                loadingEl.remove();
+        function updateStatus(messageEl, text) {
+            const indicator = messageEl.querySelector('.status-indicator');
+            if (indicator) {
+                indicator.textContent = text;
+                indicator.style.display = text ? 'inline' : 'none';
             }
         }
 
@@ -661,26 +694,124 @@
             inputEl.style.height = 'auto';
 
             addMessage('user', message);
-            addLoadingIndicator();
+            const streamingEl = createStreamingMessage();
+            const contentEl = streamingEl.querySelector('.stream-content');
+            const sqlContentEl = streamingEl.querySelector('.sql-content');
+            const sqlBlockEl = streamingEl.querySelector('.sql-block');
+            const resultsContentEl = streamingEl.querySelector('.results-content');
+            const resultsBlockEl = streamingEl.querySelector('.results-block');
+            const resultsLabelEl = streamingEl.querySelector('.results-label');
+            const analysisLabelEl = streamingEl.querySelector('.analysis-label');
+            const analysisContentEl = streamingEl.querySelector('.analysis-content');
+            const detailsSection = streamingEl.querySelector('.details-section');
+
+            let currentContent = '';
+            let analysisContent = '';
+            let currentPhase = 'generating';
+            let finalSql = null;
+            let finalResults = null;
 
             try {
-                const response = await fetch('/api/chat', {
+                const response = await fetch('/api/chat/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message })
                 });
 
-                const data = await response.json();
-                removeLoadingIndicator();
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
 
-                if (data.error) {
-                    addMessage('assistant', 'Sorry, an error occurred: ' + data.error);
-                } else {
-                    addMessage('assistant', data.answer, data.sql, data.results);
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+
+                    // Keep the last incomplete line in the buffer
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const jsonStr = line.slice(6).trim();
+                                if (!jsonStr) continue;
+                                const data = JSON.parse(jsonStr);
+
+                                switch (data.type) {
+                                    case 'status':
+                                        updateStatus(streamingEl, data.content);
+                                        break;
+
+                                    case 'phase':
+                                        currentPhase = data.content;
+                                        if (data.content === 'analyzing') {
+                                            currentContent = '';
+                                        }
+                                        break;
+
+                                    case 'token':
+                                        currentContent += data.content;
+                                        contentEl.innerHTML = formatContent(currentContent);
+                                        messagesEl.scrollTop = messagesEl.scrollHeight;
+                                        break;
+
+                                    case 'sql':
+                                        finalSql = data.content;
+                                        // Hide the raw SQL generation from main content
+                                        contentEl.style.display = 'none';
+                                        detailsSection.style.display = 'block';
+                                        sqlBlockEl.style.display = 'block';
+                                        sqlContentEl.textContent = data.content;
+                                        Prism.highlightElement(sqlContentEl);
+                                        messagesEl.scrollTop = messagesEl.scrollHeight;
+                                        break;
+
+                                    case 'results':
+                                        finalResults = data.content;
+                                        resultsLabelEl.style.display = 'block';
+                                        resultsBlockEl.style.display = 'block';
+                                        resultsContentEl.textContent = data.content;
+                                        messagesEl.scrollTop = messagesEl.scrollHeight;
+                                        break;
+
+                                    case 'analysis_token':
+                                        if (!analysisLabelEl.style.display || analysisLabelEl.style.display === 'none') {
+                                            analysisLabelEl.style.display = 'block';
+                                            analysisContentEl.style.display = 'block';
+                                        }
+                                        analysisContent += data.content;
+                                        analysisContentEl.innerHTML = formatContent(analysisContent);
+                                        messagesEl.scrollTop = messagesEl.scrollHeight;
+                                        break;
+
+                                    case 'done':
+                                        updateStatus(streamingEl, '');
+                                        // Final formatting
+                                        if (currentContent) {
+                                            contentEl.innerHTML = formatContent(currentContent);
+                                        }
+                                        if (analysisContent) {
+                                            analysisContentEl.innerHTML = formatContent(analysisContent);
+                                        }
+                                        Prism.highlightAllUnder(streamingEl);
+                                        break;
+
+                                    case 'error':
+                                        updateStatus(streamingEl, '');
+                                        contentEl.innerHTML = formatContent('Sorry, an error occurred: ' + data.content);
+                                        break;
+                                }
+                            } catch (e) {
+                                // Skip invalid JSON
+                            }
+                        }
+                    }
                 }
             } catch (error) {
-                removeLoadingIndicator();
-                addMessage('assistant', 'Sorry, failed to connect to the server.');
+                updateStatus(streamingEl, '');
+                contentEl.innerHTML = formatContent('Sorry, failed to connect to the server.');
             }
 
             isLoading = false;
